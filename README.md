@@ -1,5 +1,6 @@
 # TinDog
 Tinder For Dogs-
+
 1)Responsive Design:
   -Ensure the site is fully responsive and works well on different devices (mobiles, tablets, desktops).
   -Use Bootstrap's grid system and responsive utilities.
