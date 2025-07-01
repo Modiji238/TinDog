@@ -13,126 +13,93 @@ Tinder For Dogs-
 Includes features such as hero sections,attractive and responsive buttons,a pricing table and a Carousel for brandings
 
 
-import cv2
+import os
+import glob
+import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-import mediapipe as mp
-from PIL import Image
-from collections import deque
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping
+import joblib
 
-# ========== Load FSA-Net Keras model ==========
-model = load_model("fsanet_capsule.h5", compile=False)
+# === Step 1: Load All CSVs and Prepare Sequence Data ===
+def load_lstm_dataset(root='sessions', landmark='nose', sequence_length=50):
+    X, y = [], []
+    for session_path in glob.glob(os.path.join(root, 'session_*')):
+        csv_path = os.path.join(session_path, 'CSVs')
+        if not os.path.exists(csv_path):
+            continue
+        for file in glob.glob(os.path.join(csv_path, '*.csv')):
+            label = os.path.splitext(os.path.basename(file))[0].lower()
+            df = pd.read_csv(file)
+            coords = df[[f'{landmark}_x', f'{landmark}_y', f'{landmark}_z']].values
 
-# ========== Constants ==========
-idx_tensor = np.arange(66, dtype=np.float32)
-plot_len = 100  # length of rolling plot
-frame_size = 64  # expected input size for model
+            # Sliding window to create sequences
+            for i in range(0, len(coords) - sequence_length + 1, 5):
+                segment = coords[i:i + sequence_length]
+                if segment.shape == (sequence_length, 3):
+                    X.append(segment)
+                    y.append(label)
+    return np.array(X), np.array(y)
 
-# ========== MediaPipe face detection ==========
-mp_face = mp.solutions.face_detection
-face_detector = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.7)
+# === Step 2: Build and Train LSTM Model ===
+def train_lstm_model(X, y, model_path='lstm_classifier.h5'):
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    y_cat = to_categorical(y_encoded)
 
-# ========== Plot setup ==========
-plt.style.use("ggplot")
-fig, ax = plt.subplots()
-x_vals = list(range(plot_len))
-yaw_line, = ax.plot(x_vals, [0]*plot_len, label="Yaw")
-pitch_line, = ax.plot(x_vals, [0]*plot_len, label="Pitch")
-roll_line, = ax.plot(x_vals, [0]*plot_len, label="Roll")
-ax.set_ylim(-60, 60)
-ax.legend(loc="upper right")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_cat, test_size=0.2, random_state=42
+    )
 
-yaw_data, pitch_data, roll_data = [], [], []
-yaw_smooth, pitch_smooth, roll_smooth = deque(maxlen=5), deque(maxlen=5), deque(maxlen=5)
+    model = Sequential([
+        LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=True),
+        Dropout(0.3),
+        LSTM(32),
+        Dense(32, activation='relu'),
+        Dense(y_cat.shape[1], activation='softmax')
+    ])
 
-# ========== Baseline for neutral ==========
-baseline_yaw = baseline_pitch = baseline_roll = None
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, y_train, validation_data=(X_test, y_test),
+              epochs=50, batch_size=16, callbacks=[EarlyStopping(patience=5, restore_best_weights=True)])
 
-# ========== Start webcam ==========
-cap = cv2.VideoCapture(0)
+    model.save(model_path)
+    joblib.dump(le, 'lstm_label_encoder.pkl')
+    print("Model and label encoder saved.")
 
-def update(frame_id):
-    global baseline_yaw, baseline_pitch, baseline_roll
+    preds = model.predict(X_test)
+    print("\nClassification Report:")
+    print(classification_report(np.argmax(y_test, axis=1), np.argmax(preds, axis=1), target_names=le.classes_))
 
-    ret, frame = cap.read()
-    if not ret:
-        return
+# === Step 3: Prediction Function ===
+def predict_from_sequence(seq, model_path='lstm_classifier.h5', encoder_path='lstm_label_encoder.pkl'):
+    from tensorflow.keras.models import load_model
+    model = load_model(model_path)
+    le = joblib.load(encoder_path)
+    pred = model.predict(np.expand_dims(seq, axis=0))
+    return le.inverse_transform([np.argmax(pred)])[0], np.max(pred)
 
-    h, w, _ = frame.shape
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_detector.process(frame_rgb)
+# === Main Entry ===
+if __name__ == '__main__':
+    print("[INFO] Loading data and training LSTM model...")
+    X, y = load_lstm_dataset()
+    if len(X) == 0:
+        print("[ERROR] No data found.")
+    else:
+        train_lstm_model(X, y)
 
-    if results.detections:
-        det = results.detections[0]
-        bbox = det.location_data.relative_bounding_box
-        x = int(bbox.xmin * w)
-        y = int(bbox.ymin * h)
-        bw = int(bbox.width * w)
-        bh = int(bbox.height * h)
 
-        # Crop and preprocess face
-        x1, y1 = max(x, 0), max(y, 0)
-        x2, y2 = min(x + bw, w), min(y + bh, h)
-        face_img = frame_rgb[y1:y2, x1:x2]
-        face_img = cv2.resize(face_img, (frame_size, frame_size))
-        face_img = face_img.astype(np.float32) / 255.0
-        face_img = np.expand_dims(face_img, axis=0)
+# === Data Augmentation Ideas (as notes): ===
+# 1. Time Warping: Speed up or slow down the sequence (resample with interpolation)
+# 2. Jittering: Add slight Gaussian noise to coordinates
+# 3. Magnitude Scaling: Multiply sequence by a small scalar (~1.1 or 0.9)
+# 4. Rotation: Apply small 2D rotation on XY plane (~5 degrees)
+# 5. Window Slicing: Randomly slice smaller chunks from longer sequences
+# Make sure augmentations preserve anatomical correctness and temporal consistency.
 
-        # Predict
-        preds = model.predict(face_img)[0]
-        yaw = np.sum(tf.nn.softmax(preds[0:66]) * idx_tensor) * 3 - 99
-        pitch = np.sum(tf.nn.softmax(preds[66:132]) * idx_tensor) * 3 - 99
-        roll = np.sum(tf.nn.softmax(preds[132:198]) * idx_tensor) * 3 - 99
-
-        # Smooth values
-        yaw_smooth.append(yaw)
-        pitch_smooth.append(pitch)
-        roll_smooth.append(roll)
-        yaw_avg = np.mean(yaw_smooth)
-        pitch_avg = np.mean(pitch_smooth)
-        roll_avg = np.mean(roll_smooth)
-
-        # Calibrate neutral
-        if baseline_yaw is None:
-            baseline_yaw = yaw_avg
-            baseline_pitch = pitch_avg
-            baseline_roll = roll_avg
-
-        # Compute deviation
-        dyaw = yaw_avg - baseline_yaw
-        dpitch = pitch_avg - baseline_pitch
-        droll = roll_avg - baseline_roll
-
-        # Update data for plot
-        yaw_data.append(dyaw)
-        pitch_data.append(dpitch)
-        roll_data.append(droll)
-
-        if len(yaw_data) > plot_len:
-            yaw_data.pop(0)
-            pitch_data.pop(0)
-            roll_data.pop(0)
-
-        # Update plot
-        yaw_line.set_ydata(yaw_data + [0]*(plot_len - len(yaw_data)))
-        pitch_line.set_ydata(pitch_data + [0]*(plot_len - len(pitch_data)))
-        roll_line.set_ydata(roll_data + [0]*(plot_len - len(roll_data)))
-
-        # Display text
-        text = f"Yaw: {dyaw:+.1f}° | Pitch: {dpitch:+.1f}° | Roll: {droll:+.1f}°"
-        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50, 255, 50), 2)
-
-    cv2.imshow("FSA-Net Keras Live Head Pose", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        cap.release()
-        cv2.destroyAllWindows()
-        exit()
-
-    return yaw_line, pitch_line, roll_line
-
-ani = FuncAnimation(fig, update, interval=100)
-plt.tight_layout()
-plt.show()
+# Would you like separate augmentation functions added directly into the pipeline?
