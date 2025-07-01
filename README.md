@@ -13,102 +13,126 @@ Tinder For Dogs-
 Includes features such as hero sections,attractive and responsive buttons,a pricing table and a Carousel for brandings
 
 
-
-import os
-import glob
-import pandas as pd
+import cv2
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import joblib
-from datetime import datetime
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import mediapipe as mp
+from PIL import Image
+from collections import deque
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
-# === Step 1: Extract Polynomial Coefficients ===
-def extract_polynomial_features(csv_path, landmark='nose', degree=3):
-    df = pd.read_csv(csv_path)
-    t = np.arange(len(df))
+# ========== Load FSA-Net Keras model ==========
+model = load_model("fsanet_capsule.h5", compile=False)
 
-    coeffs = []
-    for axis in ['x', 'y', 'z']:
-        col = f'{landmark}_{axis}'
-        if col in df.columns:
-            poly = np.polyfit(t, df[col], degree)
-            coeffs.extend(poly)
-        else:
-            coeffs.extend([0]*(degree+1))  # padding if column missing
-    return coeffs
+# ========== Constants ==========
+idx_tensor = np.arange(66, dtype=np.float32)
+plot_len = 100  # length of rolling plot
+frame_size = 64  # expected input size for model
 
-# === Step 2: Load All Training Data ===
-def load_dataset(root='sessions', landmark='nose', degree=3):
-    data, labels = [], []
-    for session_path in glob.glob(os.path.join(root, 'session_*')):
-        csv_path = os.path.join(session_path, 'CSVs')
-        if not os.path.exists(csv_path):
-            continue
-        for file in glob.glob(os.path.join(csv_path, '*.csv')):
-            label = os.path.splitext(os.path.basename(file))[0].lower()
-            features = extract_polynomial_features(file, landmark, degree)
-            data.append(features)
-            labels.append(label)
-    return np.array(data), np.array(labels)
+# ========== MediaPipe face detection ==========
+mp_face = mp.solutions.face_detection
+face_detector = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.7)
 
-# === Step 3: Train Model and Save ===
-def train_and_save_model(X, y, model_path='exercise_classifier.pkl'):
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
+# ========== Plot setup ==========
+plt.style.use("ggplot")
+fig, ax = plt.subplots()
+x_vals = list(range(plot_len))
+yaw_line, = ax.plot(x_vals, [0]*plot_len, label="Yaw")
+pitch_line, = ax.plot(x_vals, [0]*plot_len, label="Pitch")
+roll_line, = ax.plot(x_vals, [0]*plot_len, label="Roll")
+ax.set_ylim(-60, 60)
+ax.legend(loc="upper right")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=0.2, random_state=42
-    )
+yaw_data, pitch_data, roll_data = [], [], []
+yaw_smooth, pitch_smooth, roll_smooth = deque(maxlen=5), deque(maxlen=5), deque(maxlen=5)
 
-    clf = RandomForestClassifier(n_estimators=100, random_state=42)
-    clf.fit(X_train, y_train)
+# ========== Baseline for neutral ==========
+baseline_yaw = baseline_pitch = baseline_roll = None
 
-    print("\nClassification Report:")
-    print(classification_report(y_test, clf.predict(X_test), target_names=le.classes_))
+# ========== Start webcam ==========
+cap = cv2.VideoCapture(0)
 
-    joblib.dump({'model': clf, 'labels': le}, model_path)
-    print(f"\nModel saved to: {model_path}")
+def update(frame_id):
+    global baseline_yaw, baseline_pitch, baseline_roll
 
-# === Step 4: Predict New Sample ===
-def predict_exercise(csv_file, model_path='exercise_classifier.pkl', landmark='nose'):
-    model_data = joblib.load(model_path)
-    clf = model_data['model']
-    le = model_data['labels']
-    features = extract_polynomial_features(csv_file, landmark)
-    pred = clf.predict([features])[0]
-    print(f"\nPredicted Exercise: {le.inverse_transform([pred])[0]}")
-    return le.inverse_transform([pred])[0]
+    ret, frame = cap.read()
+    if not ret:
+        return
 
-# === Step 5: Accept Feedback and Learn Incrementally ===
-def update_model_with_feedback(csv_file, true_label, model_path='exercise_classifier.pkl', landmark='nose'):
-    model_data = joblib.load(model_path)
-    clf = model_data['model']
-    le = model_data['labels']
+    h, w, _ = frame.shape
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_detector.process(frame_rgb)
 
-    features = extract_polynomial_features(csv_file, landmark)
-    X = np.array(model_data.get('X', []))
-    y = np.array(model_data.get('y', []))
+    if results.detections:
+        det = results.detections[0]
+        bbox = det.location_data.relative_bounding_box
+        x = int(bbox.xmin * w)
+        y = int(bbox.ymin * h)
+        bw = int(bbox.width * w)
+        bh = int(bbox.height * h)
 
-    # Encode label if new
-    if true_label not in le.classes_:
-        le.classes_ = np.append(le.classes_, true_label)
+        # Crop and preprocess face
+        x1, y1 = max(x, 0), max(y, 0)
+        x2, y2 = min(x + bw, w), min(y + bh, h)
+        face_img = frame_rgb[y1:y2, x1:x2]
+        face_img = cv2.resize(face_img, (frame_size, frame_size))
+        face_img = face_img.astype(np.float32) / 255.0
+        face_img = np.expand_dims(face_img, axis=0)
 
-    y_new = le.transform([true_label])[0]
-    X = np.vstack([X, features]) if X.size else np.array([features])
-    y = np.append(y, y_new)
+        # Predict
+        preds = model.predict(face_img)[0]
+        yaw = np.sum(tf.nn.softmax(preds[0:66]) * idx_tensor) * 3 - 99
+        pitch = np.sum(tf.nn.softmax(preds[66:132]) * idx_tensor) * 3 - 99
+        roll = np.sum(tf.nn.softmax(preds[132:198]) * idx_tensor) * 3 - 99
 
-    clf.fit(X, y)
-    joblib.dump({'model': clf, 'labels': le, 'X': X, 'y': y}, model_path)
-    print(f"Model updated with feedback and saved to: {model_path}")
+        # Smooth values
+        yaw_smooth.append(yaw)
+        pitch_smooth.append(pitch)
+        roll_smooth.append(roll)
+        yaw_avg = np.mean(yaw_smooth)
+        pitch_avg = np.mean(pitch_smooth)
+        roll_avg = np.mean(roll_smooth)
 
-# === Main Training Call ===
-if __name__ == '__main__':
-    print("\n[INFO] Loading and training model from all session CSVs...")
-    X, y = load_dataset()
-    if len(X) == 0:
-        print("[ERROR] No training data found.")
-    else:
-        train_and_save_model(X, y)
+        # Calibrate neutral
+        if baseline_yaw is None:
+            baseline_yaw = yaw_avg
+            baseline_pitch = pitch_avg
+            baseline_roll = roll_avg
+
+        # Compute deviation
+        dyaw = yaw_avg - baseline_yaw
+        dpitch = pitch_avg - baseline_pitch
+        droll = roll_avg - baseline_roll
+
+        # Update data for plot
+        yaw_data.append(dyaw)
+        pitch_data.append(dpitch)
+        roll_data.append(droll)
+
+        if len(yaw_data) > plot_len:
+            yaw_data.pop(0)
+            pitch_data.pop(0)
+            roll_data.pop(0)
+
+        # Update plot
+        yaw_line.set_ydata(yaw_data + [0]*(plot_len - len(yaw_data)))
+        pitch_line.set_ydata(pitch_data + [0]*(plot_len - len(pitch_data)))
+        roll_line.set_ydata(roll_data + [0]*(plot_len - len(roll_data)))
+
+        # Display text
+        text = f"Yaw: {dyaw:+.1f}° | Pitch: {dpitch:+.1f}° | Roll: {droll:+.1f}°"
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50, 255, 50), 2)
+
+    cv2.imshow("FSA-Net Keras Live Head Pose", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        cap.release()
+        cv2.destroyAllWindows()
+        exit()
+
+    return yaw_line, pitch_line, roll_line
+
+ani = FuncAnimation(fig, update, interval=100)
+plt.tight_layout()
+plt.show()
