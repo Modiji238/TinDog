@@ -13,65 +13,107 @@ Tinder For Dogs-
 Includes features such as hero sections,attractive and responsive buttons,a pricing table and a Carousel for brandings
 
 
-import cv2
+import pandas as pd
 import numpy as np
-import mediapipe as mp
-from collections import deque
-from tensorflow.keras.models import load_model
-import joblib
+import matplotlib.pyplot as plt
+from scipy.signal import stft, welch
+from scipy.fftpack import fft
+import librosa
+import librosa.display
+import pywt
+from kymatio.numpy import Scattering1D
+import os
 
-# === Load Trained Model and Label Encoder ===
-model = load_model('lstm_model.h5')
-label_encoder = joblib.load('label_encoder.pkl')
+# === Utility Functions ===
 
-SEQUENCE_LENGTH = 50
-buffer = deque(maxlen=SEQUENCE_LENGTH)
+def load_csv_data(csv_path, landmark='nose'):
+    df = pd.read_csv(csv_path)
+    x = df[f'{landmark}_x'].values
+    y = df[f'{landmark}_y'].values
+    z = df[f'{landmark}_z'].values
+    return x, y, z
 
-# === Initialize MediaPipe ===
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, model_complexity=1, enable_segmentation=False, min_detection_confidence=0.5)
+# === Frequency Domain Transformation Functions ===
 
-# === Start Webcam ===
-cap = cv2.VideoCapture(0)
-font = cv2.FONT_HERSHEY_SIMPLEX
-predicted_label = ""
+def plot_stft(signal, fs=30, axis='x'):
+    f, t, Zxx = stft(signal, fs=fs)
+    plt.pcolormesh(t, f, np.abs(Zxx), shading='gouraud')
+    plt.title(f'STFT Magnitude - {axis}')
+    plt.ylabel('Frequency [Hz]')
+    plt.xlabel('Time [sec]')
+    plt.colorbar()
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+def plot_psd(signal, fs=30, axis='x'):
+    f, Pxx = welch(signal, fs=fs)
+    plt.semilogy(f, Pxx)
+    plt.title(f'Power Spectral Density - {axis}')
+    plt.xlabel('Frequency [Hz]')
+    plt.ylabel('PSD')
 
-    # Flip for mirror effect and convert to RGB
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def plot_mel_spectrogram(signal, sr=30, axis='x'):
+    signal = librosa.util.fix_length(signal.astype(np.float32), size=512)
+    mel = librosa.feature.melspectrogram(y=signal, sr=sr, n_fft=128, hop_length=64)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    librosa.display.specshow(mel_db, sr=sr, hop_length=64, x_axis='time', y_axis='mel')
+    plt.colorbar(format='%+2.0f dB')
+    plt.title(f'Mel Spectrogram - {axis}')
 
-    # Get pose landmarks
-    result = pose.process(rgb)
+def plot_mfcc(signal, sr=30, axis='x'):
+    signal = librosa.util.fix_length(signal.astype(np.float32), size=512)
+    mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13)
+    librosa.display.specshow(mfcc, x_axis='time')
+    plt.colorbar()
+    plt.title(f'MFCC - {axis}')
 
-    if result.pose_landmarks:
-        # Get nose landmark
-        nose = result.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE]
-        nose_coord = [nose.x, nose.y, nose.z]
-        buffer.append(nose_coord)
+def plot_wavelet_packet(signal, axis='x'):
+    wp = pywt.WaveletPacket(data=signal, wavelet='db1', mode='symmetric', maxlevel=3)
+    levels = [node.path for node in wp.get_level(3, 'freq')]
+    values = [wp[node.path].data for node in wp.get_level(3, 'freq')]
+    plt.imshow(np.abs(values), aspect='auto', interpolation='nearest')
+    plt.title(f'Wavelet Packet Decomposition - {axis}')
+    plt.xlabel('Time')
+    plt.ylabel('Sub-band')
+    plt.colorbar()
 
-        # Draw landmark
-        h, w = frame.shape[:2]
-        cv2.circle(frame, (int(nose.x * w), int(nose.y * h)), 5, (0, 255, 0), -1)
+def plot_wavelet_scattering(signal, axis='x'):
+    T = len(signal)
+    J = 5
+    Q = 1
+    signal = signal.astype(np.float32)
+    scatter = Scattering1D(J=J, shape=T, Q=Q)
+    Sx = scatter(signal)
+    plt.imshow(Sx, aspect='auto', interpolation='nearest')
+    plt.title(f'Wavelet Scattering Transform - {axis}')
+    plt.xlabel('Scales')
+    plt.ylabel('Coefficients')
+    plt.colorbar()
 
-        # Predict when buffer is full
-        if len(buffer) == SEQUENCE_LENGTH:
-            input_seq = np.expand_dims(buffer, axis=0)  # shape: (1, 50, 3)
-            probs = model.predict(input_seq, verbose=0)[0]
-            pred_index = np.argmax(probs)
-            confidence = probs[pred_index]
-            predicted_label = label_encoder.inverse_transform([pred_index])[0] if confidence > 0.8 else "Uncertain"
+# === General Plotting Function ===
 
-    # === Display prediction ===
-    cv2.putText(frame, f'Prediction: {predicted_label}', (20, 40), font, 0.8, (0, 0, 255), 2)
+def comparative_plot(csv_path, landmark='nose', fs=30):
+    x, y, z = load_csv_data(csv_path)
+    signals = {'x': x, 'y': y, 'z': z}
+    funcs = [
+        ('STFT', plot_stft),
+        ('PSD', plot_psd),
+        ('MelSpectrogram', plot_mel_spectrogram),
+        ('MFCC', plot_mfcc),
+        ('Wavelet Packet', plot_wavelet_packet),
+        ('Wavelet Scattering', plot_wavelet_scattering)
+    ]
+    
+    for axis, signal in signals.items():
+        plt.figure(figsize=(18, 12))
+        for idx, (name, func) in enumerate(funcs, 1):
+            plt.subplot(3, 2, idx)
+            try:
+                func(signal, fs=fs, axis=axis)
+            except Exception as e:
+                plt.title(f"{name} - {axis} (Error: {e})")
+        plt.tight_layout()
+        plt.suptitle(f'Comparative Frequency Transformations - {landmark.upper()}_{axis.upper()}', fontsize=16)
+        plt.subplots_adjust(top=0.92)
+        plt.show()
 
-    cv2.imshow("Exercise Classifier", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+# Example usage:
+# comparative_plot('path_to_csv.csv', landmark='nose')
