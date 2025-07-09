@@ -38,3 +38,71 @@ def interpolate_csv(csv_path, target_rate=30):
     print(f"[✓] Interpolated CSV saved to: {out_path}")
 
     return new_df
+
+
+
+
+
+
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# === Augmentation Functions ===
+def add_noise(df, noise_level=0.002):
+    noise = np.random.normal(0, noise_level, df.shape)
+    return df + noise
+
+def time_warp(df, stretch_factor=1.2):
+    indices = np.arange(0, len(df), stretch_factor)
+    indices = indices[indices < len(df)].astype(int)
+    return df.iloc[indices].reset_index(drop=True)
+
+def reverse_sequence(df):
+    return df[::-1].reset_index(drop=True)
+
+def scale_coordinates(df, scale=1.1):
+    return df * scale
+
+def smooth_coordinates(df, window_size=5):
+    return df.rolling(window=window_size, min_periods=1, center=True).mean()
+
+# === Save Augmented CSV ===
+def save_augmented_csv(df_aug, original_path, method):
+    base_dir = os.path.dirname(original_path)
+    filename = os.path.splitext(os.path.basename(original_path))[0]
+    new_name = f"{filename}_augmented_{method}.csv"
+    
+    # Save in the same session/*/CSVs directory
+    new_path = os.path.join(base_dir, new_name)
+    df_aug.to_csv(new_path, index=False)
+    print(f"Saved: {new_path}")
+
+# === Augment Entire Landmark CSV ===
+def augment_landmark_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    landmark_cols = [col for col in df.columns if any(k in col for k in ['_x', '_y', '_z'])]
+    df_landmarks = df[landmark_cols].copy()
+
+    augmentations = {
+        'noise': add_noise,
+        'timewarp': time_warp,
+        'reverse': reverse_sequence,
+        'scale': scale_coordinates,
+        'smooth': smooth_coordinates,
+    }
+
+    for method, func in augmentations.items():
+        try:
+            df_aug = func(df_landmarks.copy())
+            save_augmented_csv(df_aug, csv_path, method)
+        except Exception as e:
+            print(f"Error in {method}: {e}")
+
+# === Run Example ===
+if __name__ == '__main__':
+    input_csv = 'sessions/session_2025-06-06_12-00-00/CSVs/flexion.csv'  # Replace with your actual path
+    augment_landmark_csv(input_csv)
+
+    
